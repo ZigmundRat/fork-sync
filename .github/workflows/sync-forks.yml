@@ -3,7 +3,7 @@ name: Sync All Forks
 on:
   schedule:
     # Runs every day at 00:00 UTC
-    - cron: '0 0 * * *'
+    - cron: '22 4 * * *'
   workflow_dispatch: # Allows manual runs from the Actions tab
 
 jobs:

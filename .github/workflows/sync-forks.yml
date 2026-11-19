@@ -14,8 +14,29 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.SYNC_TOKEN }}
         run: |
-          # List all non-archived forks owned by the authenticated user
-          gh repo list --fork --no-archived --limit 1000 --json nameWithOwner -q '.[].nameWithOwner' | while read -r repo; do
-            echo "Syncing $repo..."
-            gh repo sync "$repo" || echo "Skipped $repo (likely has merge conflicts or custom changes)"
+          echo "## 🔄 Fork Sync Summary" >> $GITHUB_STEP_SUMMARY
+          echo "| Repository | Branch | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "| :--- | :--- | :--- |" >> $GITHUB_STEP_SUMMARY
+
+          gh repo list --fork --no-archived --limit 1000 --json nameWithOwner,defaultBranchRef \
+            -q '.[] | "\(.nameWithOwner) \(.defaultBranchRef.name)"' | while read -r repo branch; do
+            
+            # Call the merge-upstream endpoint directly to get the exact status message
+            response=$(gh api -X POST "repos/$repo/merge-upstream" -f branch="$branch" 2>&1)
+            exit_code=$?
+
+            if [ $exit_code -eq 0 ]; then
+              msg=$(echo "$response" | jq -r '.message')
+              if [[ "$msg" == *"Already up to date"* ]]; then
+                echo "⏭️ $repo ($branch): Already up to date"
+                echo "| \`$repo\` | \`$branch\` | ⏭️ Up to date |" >> $GITHUB_STEP_SUMMARY
+              else
+                echo "✅ $repo ($branch): Updated! ($msg)"
+                echo "| \`$repo\` | \`$branch\` | ✅ **Updated** |" >> $GITHUB_STEP_SUMMARY
+              fi
+            else
+              err=$(echo "$response" | jq -r '.message // empty' 2>/dev/null || echo "$response")
+              echo "⚠️ $repo ($branch): Failed - $err"
+              echo "| \`$repo\` | \`$branch\` | ⚠️ Skipped (\`$err\`) |" >> $GITHUB_STEP_SUMMARY
+            fi
           done

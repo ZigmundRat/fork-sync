@@ -1,0 +1,108 @@
+
+name: Cleanup Workflow Runs
+
+on:
+  workflow_dispatch:
+    inputs:
+      repository:
+        description: 'Repository (blank = current repository)'
+        required: false
+        type: string
+        default: ''
+
+      workflow:
+        description: 'Workflow name (blank = all workflows)'
+        required: false
+        type: string
+        default: 'Sync All Forks'
+
+      dry_run:
+        description: 'Preview only - do not delete'
+        required: true
+        type: boolean
+        default: true
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Delete completed workflow runs
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.SYNC_TOKEN }}
+          TARGET_REPO: ${{ inputs.repository }}
+          TARGET_WORKFLOW: ${{ inputs.workflow }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+
+          repo="${TARGET_REPO:-$GITHUB_REPOSITORY}"
+          workflow="$TARGET_WORKFLOW"
+
+          echo "Repository: $repo"
+          echo "Workflow: ${workflow:-ALL}"
+          echo "Preview only: $DRY_RUN"
+
+          # Collect run IDs before deleting anything.
+          # This avoids pagination problems during deletion.
+          runs=$(mktemp)
+
+          gh api --paginate \
+            "repos/$repo/actions/runs?status=completed&per_page=100" \
+            --jq '.workflow_runs[] | [.id, .name] | @tsv' \
+            > "$runs"
+
+          selected=0
+          deleted=0
+          failed=0
+
+          echo "## Workflow Cleanup" >> "$GITHUB_STEP_SUMMARY"
+          echo "Repository: \`$repo\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "Workflow: \`${workflow:-ALL}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+
+          while IFS=$'\t' read -r id name; do
+            [[ -z "$id" ]] && continue
+
+            # Filter by workflow name when specified
+            if [[ -n "$workflow" && "$name" != "$workflow" ]]; then
+              continue
+            fi
+
+            # Never delete this running cleanup action
+            if [[ "$repo" == "$GITHUB_REPOSITORY" &&
+                  "$id" == "$GITHUB_RUN_ID" ]]; then
+              continue
+            fi
+
+            ((selected+=1))
+
+            if [[ "$DRY_RUN" == "true" ]]; then
+              echo "Would delete: $id ($name)"
+              continue
+            fi
+
+            echo "Deleting: $id ($name)"
+
+            if gh api -X DELETE \
+              "repos/$repo/actions/runs/$id" >/dev/null; then
+              ((deleted+=1))
+            else
+              echo "Failed to delete run $id"
+              ((failed+=1))
+            fi
+
+          done < "$runs"
+
+          rm -f "$runs"
+
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Runs selected: $selected" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Runs deleted: $deleted" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Failures: $failed" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Preview mode: $DRY_RUN" >> "$GITHUB_STEP_SUMMARY"
+
+          if (( failed > 0 )); then
+            exit 1
+          fi

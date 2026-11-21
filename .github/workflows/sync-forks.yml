@@ -3,8 +3,8 @@ name: Sync All Forks
 
 on:
   schedule:
-    # Runs daily at 04:22 UTC
-    - cron: '22 4 * * *'
+    # Runs every Sunday at 04:22 UTC
+    - cron: '22 4 * * 0'
 
   workflow_dispatch:
     inputs:
@@ -17,7 +17,6 @@ on:
 jobs:
   sync:
     runs-on: ubuntu-latest
-
     steps:
       - name: Fetch and sync forks
         env:
@@ -28,8 +27,8 @@ jobs:
           gh auth setup-git
 
           echo "## 🔄 Fork Sync Summary" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Repository | Branch | Branch Status | Tags |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| :--- | :--- | :--- | :--- |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Repository | Branch | Branch Status |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| :--- | :--- | :--- |" >> "$GITHUB_STEP_SUMMARY"
 
           # Build repository list
           if [[ -n "$TARGET_REPO" ]]; then
@@ -45,7 +44,6 @@ jobs:
               echo "Error: $TARGET_REPO is not a fork"
               exit 1
             fi
-
             printf '%s %s\n' "$TARGET_REPO" "$branch" > /tmp/fork-list
           else
             gh repo list --fork --no-archived --limit 1000 \
@@ -59,13 +57,12 @@ jobs:
             echo "----------------------------------------"
             echo "Synchronizing $repo ($branch)"
 
-            # Synchronize the default branch
+            # Synchronize the default branch only
             if response=$(gh api -X POST \
               "repos/$repo/merge-upstream" \
               -f branch="$branch" 2>&1); then
 
               msg=$(echo "$response" | jq -r '.message // empty')
-
               if [[ "$msg" == *"Already up to date"* ]]; then
                 echo "Branch already up to date"
                 branch_status="Up to date"
@@ -78,79 +75,7 @@ jobs:
               branch_status="Failed"
             fi
 
-            # Identify the upstream repository
-            if ! upstream=$(gh api "repos/$repo" \
-              --jq '.parent.full_name // empty'); then
-              echo "Unable to identify upstream"
-              tag_status="Lookup failed"
-
-            elif [[ -z "$upstream" ]]; then
-              echo "No upstream repository found"
-              tag_status="No upstream"
-
-            else
-              echo "Upstream: $upstream"
-
-              # Temporary Git repository
-              tmp=$(mktemp -d)
-
-              git -C "$tmp" init -q
-              git -C "$tmp" remote add upstream \
-                "https://github.com/$upstream.git"
-              git -C "$tmp" remote add origin \
-                "https://github.com/$repo.git"
-
-              # Fetch all upstream tags
-              if git -C "$tmp" fetch -q --no-tags upstream \
-                '+refs/tags/*:refs/tags/*'; then
-
-                # List existing fork tags
-                if git -C "$tmp" ls-remote --tags --refs origin \
-                  > "$tmp/existing-tags"; then
-
-                  added=0
-                  failed=0
-
-                  while IFS= read -r tag; do
-                    # Skip tags already present in the fork
-                    if grep -Fqx "$tag" "$tmp/existing-tags"; then
-                      continue
-                    fi
-
-                    echo "Adding tag: ${tag#refs/tags/}"
-
-                    if git -C "$tmp" push -q origin \
-                      "$tag:$tag"; then
-                      ((added+=1))
-                    else
-                      echo "Failed to push $tag"
-                      ((failed+=1))
-                    fi
-                  done < <(git -C "$tmp" for-each-ref \
-                    --format='%(refname)' refs/tags)
-
-                  if (( failed > 0 )); then
-                    tag_status="$added added, $failed failed"
-                  elif (( added > 0 )); then
-                    tag_status="$added added"
-                  else
-                    tag_status="Up to date"
-                  fi
-
-                  echo "Tags: $tag_status"
-                else
-                  echo "Failed to list fork tags"
-                  tag_status="List failed"
-                fi
-              else
-                echo "Failed to fetch upstream tags"
-                tag_status="Fetch failed"
-              fi
-
-              rm -rf "$tmp"
-            fi
-
-            echo "| \`$repo\` | \`$branch\` | $branch_status | $tag_status |" \
+            echo "| \`$repo\` | \`$branch\` | $branch_status |" \
               >> "$GITHUB_STEP_SUMMARY"
 
           done < /tmp/fork-list

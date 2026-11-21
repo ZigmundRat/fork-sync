@@ -1,42 +1,132 @@
+
 name: Sync All Forks
 
 on:
   schedule:
-    # Runs every day at 00:00 UTC
+    # Runs every day at 04:22 UTC
     - cron: '22 4 * * *'
-  workflow_dispatch: # Allows manual runs from the Actions tab
+  workflow_dispatch:
 
 jobs:
   sync:
     runs-on: ubuntu-latest
+
     steps:
       - name: Fetch and sync all forks
         env:
           GH_TOKEN: ${{ secrets.SYNC_TOKEN }}
         run: |
-          echo "## 🔄 Fork Sync Summary" >> $GITHUB_STEP_SUMMARY
-          echo "| Repository | Branch | Status |" >> $GITHUB_STEP_SUMMARY
-          echo "| :--- | :--- | :--- |" >> $GITHUB_STEP_SUMMARY
+          # Configure Git authentication using SYNC_TOKEN
+          gh auth setup-git
 
-          gh repo list --fork --no-archived --limit 1000 --json nameWithOwner,defaultBranchRef \
-            -q '.[] | "\(.nameWithOwner) \(.defaultBranchRef.name)"' | while read -r repo branch; do
-            
-            # Call the merge-upstream endpoint directly to get the exact status message
-            response=$(gh api -X POST "repos/$repo/merge-upstream" -f branch="$branch" 2>&1)
-            exit_code=$?
+          echo "## 🔄 Fork Sync Summary" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Repository | Branch | Branch Status | Tags |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| :--- | :--- | :--- | :--- |" >> "$GITHUB_STEP_SUMMARY"
 
-            if [ $exit_code -eq 0 ]; then
+          gh repo list --fork --no-archived --limit 1000 \
+            --json nameWithOwner,defaultBranchRef \
+            -q '.[] | "\(.nameWithOwner) \(.defaultBranchRef.name)"' |
+          while read -r repo branch; do
+
+            echo "----------------------------------------"
+            echo "Synchronizing $repo ($branch)"
+
+            # Synchronize the default branch
+            if response=$(gh api -X POST \
+              "repos/$repo/merge-upstream" \
+              -f branch="$branch" 2>&1); then
+
               msg=$(echo "$response" | jq -r '.message')
+
               if [[ "$msg" == *"Already up to date"* ]]; then
-                echo "⏭️ $repo ($branch): Already up to date"
-                echo "| \`$repo\` | \`$branch\` | ⏭️ Up to date |" >> $GITHUB_STEP_SUMMARY
+                echo "⏭️ Branch already up to date"
+                branch_status="⏭️ Up to date"
               else
-                echo "✅ $repo ($branch): Updated! ($msg)"
-                echo "| \`$repo\` | \`$branch\` | ✅ **Updated** |" >> $GITHUB_STEP_SUMMARY
+                echo "✅ Branch updated: $msg"
+                branch_status="✅ Updated"
               fi
             else
-              err=$(echo "$response" | jq -r '.message // empty' 2>/dev/null || echo "$response")
-              echo "⚠️ $repo ($branch): Failed - $err"
-              echo "| \`$repo\` | \`$branch\` | ⚠️ Skipped (\`$err\`) |" >> $GITHUB_STEP_SUMMARY
+              err=$(echo "$response" | jq -r '.message // empty' \
+                2>/dev/null || true)
+              [[ -z "$err" ]] && err="$response"
+              echo "⚠️ Branch sync failed: $err"
+              branch_status="⚠️ Failed"
             fi
+
+            # Identify the upstream repository
+            if ! upstream=$(gh api "repos/$repo" \
+              --jq '.parent.full_name // empty'); then
+              echo "⚠️ Unable to identify upstream"
+              tag_status="⚠️ Lookup failed"
+
+            elif [[ -z "$upstream" ]]; then
+              echo "⚠️ No upstream repository found"
+              tag_status="⏭️ No upstream"
+
+            else
+              echo "Upstream: $upstream"
+
+              # Use a temporary repository for tag synchronization
+              tmp=$(mktemp -d)
+
+              git -C "$tmp" init -q
+              git -C "$tmp" remote add upstream \
+                "https://github.com/$upstream.git"
+              git -C "$tmp" remote add origin \
+                "https://github.com/$repo.git"
+
+              # Fetch all upstream tags
+              if git -C "$tmp" fetch -q --no-tags upstream \
+                '+refs/tags/*:refs/tags/*'; then
+
+                # Obtain the tags already present in the fork
+                if git -C "$tmp" ls-remote --tags --refs origin \
+                  > "$tmp/existing-tags"; then
+
+                  added=0
+                  failed=0
+
+                  # Push only tags missing from the fork
+                  while IFS= read -r tag; do
+                    if ! grep -Fqx "$tag" \
+                      "$tmp/existing-tags"; then
+
+                      echo "Adding tag: ${tag#refs/tags/}"
+
+                      if git -C "$tmp" push -q origin \
+                        "$tag:$tag"; then
+                        ((added+=1))
+                      else
+                        echo "⚠️ Failed to push $tag"
+                        ((failed+=1))
+                      fi
+                    fi
+                  done < <(git -C "$tmp" for-each-ref \
+                    --format='%(refname)' refs/tags)
+
+                  if (( failed > 0 )); then
+                    tag_status="⚠️ $added added, $failed failed"
+                  elif (( added > 0 )); then
+                    tag_status="✅ $added added"
+                  else
+                    tag_status="⏭️ Up to date"
+                  fi
+
+                  echo "Tags: $tag_status"
+                else
+                  echo "⚠️ Failed to list fork tags"
+                  tag_status="⚠️ List failed"
+                fi
+              else
+                echo "⚠️ Failed to fetch upstream tags"
+                tag_status="⚠️ Fetch failed"
+              fi
+
+              rm -rf "$tmp"
+            fi
+
+            # Record results
+            echo "| \`$repo\` | \`$branch\` | $branch_status | $tag_status |" \
+              >> "$GITHUB_STEP_SUMMARY"
+
           done

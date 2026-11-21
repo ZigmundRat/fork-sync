@@ -14,7 +14,7 @@ on:
         description: 'Workflow name (blank = all workflows)'
         required: false
         type: string
-        default: 'Sync All Forks'
+        default: ''
 
       dry_run:
         description: 'Preview only - do not delete'
@@ -27,7 +27,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Delete completed workflow runs
+      - name: Cleanup completed workflow runs
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.SYNC_TOKEN }}
@@ -40,37 +40,73 @@ jobs:
           repo="${TARGET_REPO:-$GITHUB_REPOSITORY}"
           workflow="$TARGET_WORKFLOW"
 
+          echo "========================================"
+          echo " Workflow Run Cleanup"
+          echo "========================================"
           echo "Repository: $repo"
-          echo "Workflow: ${workflow:-ALL}"
+          echo "Workflow filter: ${workflow:-ALL}"
           echo "Preview only: $DRY_RUN"
+          echo ""
 
-          # Collect run IDs before deleting anything.
-          # This avoids pagination problems during deletion.
           runs=$(mktemp)
+          trap 'rm -f "$runs"' EXIT
 
-          gh api --paginate \
+          # Retrieve all completed runs, including pagination
+          echo "Fetching completed workflow runs..."
+
+          if ! gh api --paginate \
             "repos/$repo/actions/runs?status=completed&per_page=100" \
             --jq '.workflow_runs[] | [.id, .name] | @tsv' \
-            > "$runs"
+            > "$runs"; then
+            echo "::error::Failed to retrieve runs for $repo"
+            exit 1
+          fi
+
+          total=$(wc -l < "$runs")
+          echo "Total completed runs found: $total"
+          echo ""
+
+          # Initialize job summary
+          {
+            echo "## Workflow Run Cleanup"
+            echo ""
+            echo "**Repository:** \`$repo\`"
+            echo ""
+            echo "**Workflow filter:** \`${workflow:-ALL}\`"
+            echo ""
+            echo "**Preview only:** $DRY_RUN"
+            echo ""
+            echo "**Total completed runs:** $total"
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          # Show available workflows
+          echo "Available workflow names:"
+          if (( total > 0 )); then
+            cut -f2- "$runs" | sort | uniq -c | sort -rn
+          else
+            echo "(No completed workflow runs found)"
+          fi
+          echo ""
 
           selected=0
           deleted=0
           failed=0
 
-          echo "## Workflow Cleanup" >> "$GITHUB_STEP_SUMMARY"
-          echo "Repository: \`$repo\`" >> "$GITHUB_STEP_SUMMARY"
-          echo "Workflow: \`${workflow:-ALL}\`" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "========================================"
+          echo " Matching Runs"
+          echo "========================================"
 
+          # Process each completed run
           while IFS=$'\t' read -r id name; do
             [[ -z "$id" ]] && continue
 
-            # Filter by workflow name when specified
+            # Apply optional workflow name filter
             if [[ -n "$workflow" && "$name" != "$workflow" ]]; then
               continue
             fi
 
-            # Never delete this running cleanup action
+            # Never delete the current cleanup run
             if [[ "$repo" == "$GITHUB_REPOSITORY" &&
                   "$id" == "$GITHUB_RUN_ID" ]]; then
               continue
@@ -79,29 +115,62 @@ jobs:
             ((selected+=1))
 
             if [[ "$DRY_RUN" == "true" ]]; then
-              echo "Would delete: $id ($name)"
-              continue
-            fi
-
-            echo "Deleting: $id ($name)"
-
-            if gh api -X DELETE \
-              "repos/$repo/actions/runs/$id" >/dev/null; then
-              ((deleted+=1))
+              echo "WOULD DELETE: $id ($name)"
             else
-              echo "Failed to delete run $id"
-              ((failed+=1))
+              echo "DELETING: $id ($name)"
+
+              if gh api -X DELETE \
+                "repos/$repo/actions/runs/$id" >/dev/null; then
+                ((deleted+=1))
+              else
+                echo "::warning::Failed to delete run $id"
+                ((failed+=1))
+              fi
             fi
 
           done < "$runs"
 
-          rm -f "$runs"
+          if (( selected == 0 )); then
+            echo "No matching completed runs found."
+            if [[ -n "$workflow" ]]; then
+              echo "Check that the workflow name is correct."
+              echo "Leave the workflow field blank to select all workflows."
+            fi
+          fi
 
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "- Runs selected: $selected" >> "$GITHUB_STEP_SUMMARY"
-          echo "- Runs deleted: $deleted" >> "$GITHUB_STEP_SUMMARY"
-          echo "- Failures: $failed" >> "$GITHUB_STEP_SUMMARY"
-          echo "- Preview mode: $DRY_RUN" >> "$GITHUB_STEP_SUMMARY"
+          echo ""
+          echo "========================================"
+          echo " Cleanup Results"
+          echo "========================================"
+          echo "Completed runs found: $total"
+          echo "Matching runs:       $selected"
+          echo "Deleted:             $deleted"
+          echo "Failed:              $failed"
+          echo "Preview only:        $DRY_RUN"
+
+          # Write summary
+          {
+            echo "### Results"
+            echo ""
+            echo "| Metric | Count |"
+            echo "| :--- | ---: |"
+            echo "| Completed runs found | $total |"
+            echo "| Matching runs | $selected |"
+            echo "| Deleted | $deleted |"
+            echo "| Failed | $failed |"
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if (( selected == 0 )); then
+            echo "**No matching completed runs found.**" \
+              >> "$GITHUB_STEP_SUMMARY"
+          elif [[ "$DRY_RUN" == "true" ]]; then
+            echo "**Preview only. No runs were deleted.**" \
+              >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "**Deleted $deleted workflow runs.**" \
+              >> "$GITHUB_STEP_SUMMARY"
+          fi
 
           if (( failed > 0 )); then
             exit 1
